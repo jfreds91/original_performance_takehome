@@ -106,11 +106,16 @@ class KernelBuilder:
         instrs: list[Instruction] = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # Pack ops 1 and 2 (both read val_vec, independent)
             # tmp1_vec = val_vec OP1 const1_vec
-            instrs.append({"valu": [(op1, tmp1_vec, val_vec, hash_const_vecs[val1])]})
-            # tmp2_vec = val_vec OP3 const3_vec  
-            instrs.append({"valu": [(op3, tmp2_vec, val_vec, hash_const_vecs[val3])]})
-            # val_vec = tmp1_vec OP2 tmp2_vec
+            # tmp2_vec = val_vec OP3 const3_vec
+            instrs.append({
+                "valu": [
+                    (op1, tmp1_vec, val_vec, hash_const_vecs[val1]),
+                    (op3, tmp2_vec, val_vec, hash_const_vecs[val3]),
+                ]
+            })
+            # val_vec = tmp1_vec OP2 tmp2_vec (depends on above)
             instrs.append({"valu": [(op2, val_vec, tmp1_vec, tmp2_vec)]})
 
         return instrs
