@@ -120,12 +120,46 @@ class KernelBuilder:
 
         return instrs
 
+    def build_hash_simd_2batch(
+        self,
+        val_a: int, val_b: int,
+        tmp1_a: int, tmp1_b: int,
+        tmp2_a: int, tmp2_b: int,
+        hash_const_vecs: dict[int, int]
+    ) -> list[Instruction]:
+        """
+        SIMD hash for 2 batches (16 values) in parallel.
+        Uses 4 vALU slots per instruction (2 per batch).
+        """
+        instrs: list[Instruction] = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # Pack all 4 ops: 2 for batch A, 2 for batch B
+            instrs.append({
+                "valu": [
+                    (op1, tmp1_a, val_a, hash_const_vecs[val1]),
+                    (op3, tmp2_a, val_a, hash_const_vecs[val3]),
+                    (op1, tmp1_b, val_b, hash_const_vecs[val1]),
+                    (op3, tmp2_b, val_b, hash_const_vecs[val3]),
+                ]
+            })
+            # Final combine: 2 ops for A and B
+            instrs.append({
+                "valu": [
+                    (op2, val_a, tmp1_a, tmp2_a),
+                    (op2, val_b, tmp1_b, tmp2_b),
+                ]
+            })
+
+        return instrs
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ) -> None:
         """
-        Optimized kernel that loads walker state into scratch once,
-        operates on scratch throughout, and stores results once at end.
+        Optimized kernel with software pipelining and double buffering.
+        Processes 2 batches (16 walkers) in parallel, overlapping loads
+        of batch N+1 with compute of batch N for ~2x speedup.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -151,31 +185,27 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         eight_const = self.scratch_const(8)
+        sixteen_const = self.scratch_const(16)
 
         # Allocate scratch arrays for all walker state (256 each)
-        walker_idx = self.alloc_scratch("walker_idx", batch_size)  # scratch[walker_idx:walker_idx+256]
-        walker_val = self.alloc_scratch("walker_val", batch_size)  # scratch[walker_val:walker_val+256]
+        walker_idx = self.alloc_scratch("walker_idx", batch_size)
+        walker_val = self.alloc_scratch("walker_val", batch_size)
         
-        # Temp addresses for vload/vstore (need scalar addresses in scratch)
-        addr_idx = self.alloc_scratch("addr_idx")  # address pointer for indices
-        addr_val = self.alloc_scratch("addr_val")  # address pointer for values
+        # Temp addresses for vload/vstore
+        addr_idx = self.alloc_scratch("addr_idx")
+        addr_val = self.alloc_scratch("addr_val")
         
         # ============ LOAD PHASE: Load all walker state into scratch ============
-        # Initialize address pointers to start of idx and val arrays in memory
         self.add("alu", ("+", addr_idx, self.scratch["inp_indices_p"], zero_const))
         self.add("alu", ("+", addr_val, self.scratch["inp_values_p"], zero_const))
         
-        # Load 256 indices and 256 values using vload (8 at a time)
-        # Use both load slots per cycle: load indices and values in parallel
         for chunk in range(0, batch_size, VLEN):
-            # vload 8 indices and 8 values in the same cycle (2 load slots)
             self.instrs.append({
                 "load": [
                     ("vload", walker_idx + chunk, addr_idx),
                     ("vload", walker_val + chunk, addr_val),
                 ]
             })
-            # Increment both address pointers by 8
             self.instrs.append({
                 "alu": [
                     ("+", addr_idx, addr_idx, eight_const),
@@ -183,25 +213,35 @@ class KernelBuilder:
                 ]
             })
 
-        # Pause for debug sync
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting main loop"))
+        self.add("debug", ("comment", "Starting main loop with software pipelining"))
 
-        # ============ COMPUTE PHASE: Work entirely in scratch ============
-        # Process walkers in batches of VLEN (8) using SIMD
+        # ============ DOUBLE BUFFER ALLOCATION ============
+        # Buffer A: for even pipeline stages
+        tree_addrs_A = self.alloc_scratch("tree_addrs_A", VLEN * 2)  # 16 addresses
+        node_vals_A = self.alloc_scratch("node_vals_A", VLEN * 2)    # 16 values
         
-        # Vector temp registers for SIMD operations
-        tmp1_vec = self.alloc_scratch("tmp1_vec", VLEN)  # 8-element vector temp
-        tmp2_vec = self.alloc_scratch("tmp2_vec", VLEN)  # 8-element vector temp for hash
-        tmp3_vec = self.alloc_scratch("tmp3_vec", VLEN)  # 8-element vector for select result
+        # Buffer B: for odd pipeline stages  
+        tree_addrs_B = self.alloc_scratch("tree_addrs_B", VLEN * 2)
+        node_vals_B = self.alloc_scratch("node_vals_B", VLEN * 2)
         
-        # Broadcast constants to vectors (need vector versions for vALU)
+        # Per-batch temp vectors for parallel processing
+        # Batch A temps (for first 8 walkers in double-batch)
+        tmp1_vec_a = self.alloc_scratch("tmp1_vec_a", VLEN)
+        tmp2_vec_a = self.alloc_scratch("tmp2_vec_a", VLEN)
+        tmp3_vec_a = self.alloc_scratch("tmp3_vec_a", VLEN)
+        
+        # Batch B temps (for second 8 walkers in double-batch)
+        tmp1_vec_b = self.alloc_scratch("tmp1_vec_b", VLEN)
+        tmp2_vec_b = self.alloc_scratch("tmp2_vec_b", VLEN)
+        tmp3_vec_b = self.alloc_scratch("tmp3_vec_b", VLEN)
+        
+        # Broadcast constants to vectors
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         one_vec = self.alloc_scratch("one_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         
-        # Broadcast scalar constants to vectors
         self.instrs.append({"valu": [("vbroadcast", zero_vec, zero_const)]})
         self.instrs.append({"valu": [("vbroadcast", one_vec, one_const)]})
         self.instrs.append({"valu": [("vbroadcast", two_vec, two_const)]})
@@ -212,90 +252,212 @@ class KernelBuilder:
         for (op1, val1, op2, op3, val3) in HASH_STAGES:
             for const_val in [val1, val3]:
                 if const_val not in hash_const_vecs:
-                    # Allocate vector and broadcast constant
                     const_scalar = self.scratch_const(const_val)
                     const_vec = self.alloc_scratch(f"hash_const_{const_val}", VLEN)
                     self.instrs.append({"valu": [("vbroadcast", const_vec, const_scalar)]})
                     hash_const_vecs[const_val] = const_vec
-        
-        # Scratch space for 8 tree addresses and 8 node values (for gathering)
-        tree_addrs = self.alloc_scratch("tree_addrs", VLEN)  # 8 addresses
-        node_vals = self.alloc_scratch("node_vals", VLEN)    # 8 gathered node values
 
-        for round in range(rounds):
-            # Process 256 walkers in batches of 8
-            for batch in range(batch_size // VLEN):  # 32 batches
-                batch_offset = batch * VLEN
-                idx_base = walker_idx + batch_offset  # Base of 8 contiguous indices
-                val_base = walker_val + batch_offset  # Base of 8 contiguous values
-                
-                # === GATHER PHASE: Load 8 scattered tree node values ===
-                # Compute 8 tree addresses in ONE cycle (pack all 8 ALU ops)
-                # tree_addr[j] = forest_values_p + idx[j]
-                self.instrs.append({
-                    "alu": [
-                        ("+", tree_addrs + j, self.scratch["forest_values_p"], idx_base + j)
-                        for j in range(VLEN)
+        # ============ HELPER FUNCTIONS FOR PIPELINE ============
+        def emit_addr_calc(double_batch: int, tree_addrs: int) -> None:
+            """Compute 16 tree addresses for a double-batch (uses ALU, 2 cycles)."""
+            batch_offset = double_batch * VLEN * 2
+            idx_base_a = walker_idx + batch_offset
+            idx_base_b = walker_idx + batch_offset + VLEN
+            
+            # First 12 addresses in one cycle
+            self.instrs.append({
+                "alu": [
+                    ("+", tree_addrs + j, self.scratch["forest_values_p"], idx_base_a + j)
+                    for j in range(VLEN)
+                ] + [
+                    ("+", tree_addrs + VLEN + j, self.scratch["forest_values_p"], idx_base_b + j)
+                    for j in range(4)  # Only first 4 of batch B (12 total)
+                ]
+            })
+            # Remaining 4 addresses
+            self.instrs.append({
+                "alu": [
+                    ("+", tree_addrs + VLEN + 4 + j, self.scratch["forest_values_p"], idx_base_b + 4 + j)
+                    for j in range(4)
+                ]
+            })
+        
+        def emit_loads(tree_addrs: int, node_vals: int) -> list[Instruction]:
+            """Load 16 scattered tree values (uses LOAD, 8 cycles). Returns list of instructions."""
+            instrs = []
+            for j in range(0, VLEN * 2, 2):
+                instrs.append({
+                    "load": [
+                        ("load", node_vals + j, tree_addrs + j),
+                        ("load", node_vals + j + 1, tree_addrs + j + 1),
                     ]
                 })
+            return instrs
+        
+        def emit_compute(double_batch: int, node_vals: int) -> list[Instruction]:
+            """Compute phase for a double-batch (XOR, hash, post-hash). Returns list of instructions."""
+            instrs = []
+            batch_offset = double_batch * VLEN * 2
+            idx_a = walker_idx + batch_offset
+            idx_b = walker_idx + batch_offset + VLEN
+            val_a = walker_val + batch_offset
+            val_b = walker_val + batch_offset + VLEN
+            node_a = node_vals
+            node_b = node_vals + VLEN
+            
+            # XOR: val ^= node_val (pack both batches)
+            instrs.append({
+                "valu": [
+                    ("^", val_a, val_a, node_a),
+                    ("^", val_b, val_b, node_b),
+                ]
+            })
+            
+            # Hash phase: 2 batches in parallel
+            hash_instrs = self.build_hash_simd_2batch(
+                val_a, val_b, tmp1_vec_a, tmp1_vec_b, tmp2_vec_a, tmp2_vec_b, hash_const_vecs
+            )
+            instrs.extend(hash_instrs)
+            
+            # Post-hash phase (optimized ordering)
+            # Pack independent ops: mod and mul are independent
+            instrs.append({
+                "valu": [
+                    ("%", tmp1_vec_a, val_a, two_vec),
+                    ("%", tmp1_vec_b, val_b, two_vec),
+                    ("*", idx_a, idx_a, two_vec),
+                    ("*", idx_b, idx_b, two_vec),
+                ]
+            })
+            
+            # eq operations
+            instrs.append({
+                "valu": [
+                    ("==", tmp1_vec_a, tmp1_vec_a, zero_vec),
+                    ("==", tmp1_vec_b, tmp1_vec_b, zero_vec),
+                ]
+            })
+            
+            # vselect 1 for batch A (flow bottleneck - only 1 slot)
+            instrs.append({"flow": [("vselect", tmp3_vec_a, tmp1_vec_a, one_vec, two_vec)]})
+            
+            # vselect 1 for batch B + add for batch A (overlap flow with vALU!)
+            instrs.append({
+                "flow": [("vselect", tmp3_vec_b, tmp1_vec_b, one_vec, two_vec)],
+                "valu": [("+", idx_a, idx_a, tmp3_vec_a)],
+            })
+            
+            # add for batch B
+            instrs.append({"valu": [("+", idx_b, idx_b, tmp3_vec_b)]})
+            
+            # lt operations (pack both)
+            instrs.append({
+                "valu": [
+                    ("<", tmp1_vec_a, idx_a, n_nodes_vec),
+                    ("<", tmp1_vec_b, idx_b, n_nodes_vec),
+                ]
+            })
+            
+            # vselect 2 for batch A
+            instrs.append({"flow": [("vselect", idx_a, tmp1_vec_a, idx_a, zero_vec)]})
+            
+            # vselect 2 for batch B
+            instrs.append({"flow": [("vselect", idx_b, tmp1_vec_b, idx_b, zero_vec)]})
+            
+            return instrs
+
+        # ============ MAIN LOOP WITH SOFTWARE PIPELINING ============
+        n_double_batches = batch_size // (VLEN * 2)  # 16 double-batches of 16 walkers each
+        
+        for round_idx in range(rounds):
+            # Use alternating buffers
+            buffers = [
+                (tree_addrs_A, node_vals_A),
+                (tree_addrs_B, node_vals_B),
+            ]
+            
+            # BOOTSTRAP: Load first double-batch (no compute to overlap with)
+            emit_addr_calc(0, buffers[0][0])
+            load_instrs = emit_loads(buffers[0][0], buffers[0][1])
+            self.instrs.extend(load_instrs)
+            
+            # STEADY STATE: Interleave load(N+1) with compute(N)
+            for db in range(n_double_batches - 1):
+                curr_buf = buffers[db % 2]
+                next_buf = buffers[(db + 1) % 2]
                 
-                # Load 8 tree node values using both load slots (4 cycles)
-                for j in range(0, VLEN, 2):
-                    self.instrs.append({
-                        "load": [
-                            ("load", node_vals + j, tree_addrs + j),
-                            ("load", node_vals + j + 1, tree_addrs + j + 1),
-                        ]
-                    })
+                # Get compute instructions for current double-batch
+                compute_instrs = emit_compute(db, curr_buf[1])
                 
-                # === PRE-HASH SIMD: XOR values with node values ===
-                # val_vec ^= node_vals (8 XORs in one vALU slot)
+                # Get load instructions for next double-batch
+                # First emit addr calc (uses ALU, can overlap with first compute instrs)
+                next_batch_offset = (db + 1) * VLEN * 2
+                idx_base_a = walker_idx + next_batch_offset
+                idx_base_b = walker_idx + next_batch_offset + VLEN
+                
+                # Interleave: addr_calc + first compute instruction
+                # Cycle 1: first 12 addr calcs + XOR
+                first_compute = compute_instrs[0]  # XOR instruction
                 self.instrs.append({
-                    "valu": [("^", val_base, val_base, node_vals)]
+                    "alu": [
+                        ("+", next_buf[0] + j, self.scratch["forest_values_p"], idx_base_a + j)
+                        for j in range(VLEN)
+                    ] + [
+                        ("+", next_buf[0] + VLEN + j, self.scratch["forest_values_p"], idx_base_b + j)
+                        for j in range(4)
+                    ],
+                    "valu": first_compute.get("valu", []),
                 })
                 
-                # === HASH PHASE: Now fully SIMD! ===
-                hash_instrs = self.build_hash_simd(val_base, tmp1_vec, tmp2_vec, hash_const_vecs)
-                self.instrs.extend(hash_instrs)
+                # Cycle 2: remaining 4 addr calcs + hash stage 1 (ops 1&2)
+                second_compute = compute_instrs[1]  # First hash instruction
+                self.instrs.append({
+                    "alu": [
+                        ("+", next_buf[0] + VLEN + 4 + j, self.scratch["forest_values_p"], idx_base_b + 4 + j)
+                        for j in range(4)
+                    ],
+                    "valu": second_compute.get("valu", []),
+                })
                 
-                # === POST-HASH SIMD: Compute next indices ===
-                # tmp1_vec = val_vec % 2
-                self.instrs.append({"valu": [("%", tmp1_vec, val_base, two_vec)]})
+                # Cycles 3-10: loads + remaining hash instructions
+                load_instrs = emit_loads(next_buf[0], next_buf[1])  # 8 load instructions
+                compute_idx = 2  # Start from 3rd compute instruction
                 
-                # tmp1_vec = (tmp1_vec == 0)
-                self.instrs.append({"valu": [("==", tmp1_vec, tmp1_vec, zero_vec)]})
+                for load_instr in load_instrs:
+                    if compute_idx < len(compute_instrs):
+                        # Merge load with compute
+                        merged = dict(load_instr)
+                        comp = compute_instrs[compute_idx]
+                        for engine, slots in comp.items():
+                            if engine in merged:
+                                merged[engine].extend(slots)
+                            else:
+                                merged[engine] = list(slots)
+                        self.instrs.append(merged)
+                        compute_idx += 1
+                    else:
+                        # Just load, no more compute to overlap
+                        self.instrs.append(load_instr)
                 
-                # tmp3_vec = tmp1_vec ? 1 : 2 (vselect)
-                self.instrs.append({"flow": [("vselect", tmp3_vec, tmp1_vec, one_vec, two_vec)]})
-                
-                # idx_vec = idx_vec * 2
-                self.instrs.append({"valu": [("*", idx_base, idx_base, two_vec)]})
-                
-                # idx_vec = idx_vec + tmp3_vec
-                self.instrs.append({"valu": [("+", idx_base, idx_base, tmp3_vec)]})
-                
-                # tmp1_vec = idx_vec < n_nodes_vec
-                self.instrs.append({"valu": [("<", tmp1_vec, idx_base, n_nodes_vec)]})
-                
-                # idx_vec = tmp1_vec ? idx_vec : 0 (vselect)
-                self.instrs.append({"flow": [("vselect", idx_base, tmp1_vec, idx_base, zero_vec)]})
+                # Remaining compute instructions (after loads are done)
+                while compute_idx < len(compute_instrs):
+                    self.instrs.append(compute_instrs[compute_idx])
+                    compute_idx += 1
+            
+            # DRAIN: Compute final double-batch (no next batch to load)
+            last_buf = buffers[(n_double_batches - 1) % 2]
+            compute_instrs = emit_compute(n_double_batches - 1, last_buf[1])
+            self.instrs.extend(compute_instrs)
 
         # ============ STORE PHASE: Write final values to memory ============
-        # Only need to store values (indices not checked by test)
-        # Reset address pointer
         self.add("alu", ("+", addr_val, self.scratch["inp_values_p"], zero_const))
         
         for chunk in range(0, batch_size, VLEN):
-            # vstore 8 values per cycle (using 1 store slot)
             self.instrs.append({
-                "store": [
-                    ("vstore", addr_val, walker_val + chunk),
-                ]
+                "store": [("vstore", addr_val, walker_val + chunk)]
             })
-            # Increment address pointer by 8
             self.add("alu", ("+", addr_val, addr_val, eight_const))
 
-        # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734

@@ -24,4 +24,13 @@ gets us to 9.2x
 
 ## optim 5: Pack SIMD in hash
 
-A few can be parallelized to use multiple slots
+A few can be parallelized to use multiple slots. Gets us to 11.4x
+
+## Optimization 6: Batch interleaving
+
+Hardest and scariest to implement, but got to 25.8x speedup (5715 cycles). That crosses the "decent" threshold in their suite of unit tests! I am running two batches at a time, interleaved to hide Load and Flow latency.
+
+## Next Steps:
+
+1. Looks from the trace like there's room to interleave a third batch. That may get us to 35-40x.
+2. Additionally, my ALUs are barely utilized. I suspect that I can probably have an extra worker that is just using ALU headroom instead of SIMD
