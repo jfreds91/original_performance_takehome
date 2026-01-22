@@ -162,55 +162,78 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting main loop"))
 
         # ============ COMPUTE PHASE: Work entirely in scratch ============
-        body = []  # array of slots
-
+        # Process walkers in batches of VLEN (8) to enable SIMD later
+        
         # Temp scratch registers for computation
         tmp_idx = self.alloc_scratch("tmp_idx")
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
+        
+        # Scratch space for 8 tree addresses and 8 node values (for gathering)
+        tree_addrs = self.alloc_scratch("tree_addrs", VLEN)  # 8 addresses
+        node_vals = self.alloc_scratch("node_vals", VLEN)    # 8 gathered node values
 
         for round in range(rounds):
-            for i in range(batch_size):
-                # Read idx and val from SCRATCH (not memory)
-                scratch_idx_addr = walker_idx + i  # this is just unrolling, it's not changing a scratch value
-                scratch_val_addr = walker_val + i
+            # Process 256 walkers in batches of 8
+            for batch in range(batch_size // VLEN):  # 32 batches
+                batch_offset = batch * VLEN
                 
-                # Copy walker's idx from storage to working register: tmp_idx = scratch[walker_idx + i]
-                # ALU with +0 copies: scratch[tmp_idx] = scratch[scratch_idx_addr] + scratch[zero_const]
-                body.append(("alu", ("+", tmp_idx, scratch_idx_addr, zero_const)))
+                # === GATHER PHASE: Load 8 scattered tree node values ===
+                # First, compute 8 tree addresses: tree_addr[j] = forest_values_p + idx[batch_offset + j]
+                for j in range(VLEN):
+                    walker_i = batch_offset + j
+                    scratch_idx_addr = walker_idx + walker_i
+                    # tree_addrs[j] = forest_values_p + walker_idx[walker_i]
+                    self.instrs.append({
+                        "alu": [("+", tree_addrs + j, self.scratch["forest_values_p"], scratch_idx_addr)]
+                    })
                 
-                # Copy walker's val from storage to working register: tmp_val = scratch[walker_val + i]
-                body.append(("alu", ("+", tmp_val, scratch_val_addr, zero_const)))
+                # Now load 8 tree node values using both load slots (4 cycles)
+                for j in range(0, VLEN, 2):  # 0, 2, 4, 6
+                    self.instrs.append({
+                        "load": [
+                            ("load", node_vals + j, tree_addrs + j),
+                            ("load", node_vals + j + 1, tree_addrs + j + 1),
+                        ]
+                    })
                 
-                # node_val = mem[forest_values_p + idx] - MUST hit memory
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                # === COMPUTE PHASE: Process each walker in batch ===
+                # (Still scalar for now, but node values are gathered)
+                body = []
+                for j in range(VLEN):
+                    walker_i = batch_offset + j
+                    scratch_idx_addr = walker_idx + walker_i
+                    scratch_val_addr = walker_val + walker_i
+                    
+                    # Copy walker's idx and val to working registers
+                    body.append(("alu", ("+", tmp_idx, scratch_idx_addr, zero_const)))
+                    body.append(("alu", ("+", tmp_val, scratch_val_addr, zero_const)))
+                    
+                    # node_val is already gathered in node_vals[j]
+                    body.append(("alu", ("+", tmp_node_val, node_vals + j, zero_const)))
+                    
+                    # val = myhash(val ^ node_val)
+                    body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                    body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, walker_i))
+                    
+                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                    body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                    body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                    body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                    body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                    
+                    # idx = 0 if idx >= n_nodes else idx
+                    body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                    
+                    # Store idx and val back to scratch
+                    body.append(("alu", ("+", scratch_idx_addr, tmp_idx, zero_const)))
+                    body.append(("alu", ("+", scratch_val_addr, tmp_val, zero_const)))
                 
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                
-                # Store idx and val back to SCRATCH (not memory)
-                # Copy tmp_idx to scratch[walker_idx + i]
-                # We need: scratch[scratch_idx_addr] = tmp_idx
-                # ALU writes to dest, so: scratch[scratch_idx_addr] = tmp_idx + 0
-                body.append(("alu", ("+", scratch_idx_addr, tmp_idx, zero_const)))
-                body.append(("alu", ("+", scratch_val_addr, tmp_val, zero_const)))
-
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+                body_instrs = self.build(body)
+                self.instrs.extend(body_instrs)
 
         # ============ STORE PHASE: Write final values to memory ============
         # Only need to store values (indices not checked by test)
