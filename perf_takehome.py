@@ -94,6 +94,27 @@ class KernelBuilder:
 
         return slots
 
+    def build_hash_simd(
+        self, val_vec: int, tmp1_vec: int, tmp2_vec: int, hash_const_vecs: dict[int, int]
+    ) -> list[Instruction]:
+        """
+        SIMD version of hash - operates on 8 values at once.
+        val_vec: base address of 8 contiguous values to hash in place
+        tmp1_vec, tmp2_vec: base addresses of 8-element temp vectors
+        hash_const_vecs: maps scalar constant value -> base address of broadcasted vector
+        """
+        instrs: list[Instruction] = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # tmp1_vec = val_vec OP1 const1_vec
+            instrs.append({"valu": [(op1, tmp1_vec, val_vec, hash_const_vecs[val1])]})
+            # tmp2_vec = val_vec OP3 const3_vec  
+            instrs.append({"valu": [(op3, tmp2_vec, val_vec, hash_const_vecs[val3])]})
+            # val_vec = tmp1_vec OP2 tmp2_vec
+            instrs.append({"valu": [(op2, val_vec, tmp1_vec, tmp2_vec)]})
+
+        return instrs
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ) -> None:
@@ -162,13 +183,35 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting main loop"))
 
         # ============ COMPUTE PHASE: Work entirely in scratch ============
-        # Process walkers in batches of VLEN (8) to enable SIMD later
+        # Process walkers in batches of VLEN (8) using SIMD
         
-        # Temp scratch registers for computation
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Vector temp registers for SIMD operations
+        tmp1_vec = self.alloc_scratch("tmp1_vec", VLEN)  # 8-element vector temp
+        tmp2_vec = self.alloc_scratch("tmp2_vec", VLEN)  # 8-element vector temp for hash
+        tmp3_vec = self.alloc_scratch("tmp3_vec", VLEN)  # 8-element vector for select result
+        
+        # Broadcast constants to vectors (need vector versions for vALU)
+        zero_vec = self.alloc_scratch("zero_vec", VLEN)
+        one_vec = self.alloc_scratch("one_vec", VLEN)
+        two_vec = self.alloc_scratch("two_vec", VLEN)
+        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
+        
+        # Broadcast scalar constants to vectors
+        self.instrs.append({"valu": [("vbroadcast", zero_vec, zero_const)]})
+        self.instrs.append({"valu": [("vbroadcast", one_vec, one_const)]})
+        self.instrs.append({"valu": [("vbroadcast", two_vec, two_const)]})
+        self.instrs.append({"valu": [("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])]})
+        
+        # Pre-broadcast all hash constants to vectors
+        hash_const_vecs: dict[int, int] = {}
+        for (op1, val1, op2, op3, val3) in HASH_STAGES:
+            for const_val in [val1, val3]:
+                if const_val not in hash_const_vecs:
+                    # Allocate vector and broadcast constant
+                    const_scalar = self.scratch_const(const_val)
+                    const_vec = self.alloc_scratch(f"hash_const_{const_val}", VLEN)
+                    self.instrs.append({"valu": [("vbroadcast", const_vec, const_scalar)]})
+                    hash_const_vecs[const_val] = const_vec
         
         # Scratch space for 8 tree addresses and 8 node values (for gathering)
         tree_addrs = self.alloc_scratch("tree_addrs", VLEN)  # 8 addresses
@@ -178,19 +221,21 @@ class KernelBuilder:
             # Process 256 walkers in batches of 8
             for batch in range(batch_size // VLEN):  # 32 batches
                 batch_offset = batch * VLEN
+                idx_base = walker_idx + batch_offset  # Base of 8 contiguous indices
+                val_base = walker_val + batch_offset  # Base of 8 contiguous values
                 
                 # === GATHER PHASE: Load 8 scattered tree node values ===
-                # First, compute 8 tree addresses: tree_addr[j] = forest_values_p + idx[batch_offset + j]
-                for j in range(VLEN):
-                    walker_i = batch_offset + j
-                    scratch_idx_addr = walker_idx + walker_i
-                    # tree_addrs[j] = forest_values_p + walker_idx[walker_i]
-                    self.instrs.append({
-                        "alu": [("+", tree_addrs + j, self.scratch["forest_values_p"], scratch_idx_addr)]
-                    })
+                # Compute 8 tree addresses in ONE cycle (pack all 8 ALU ops)
+                # tree_addr[j] = forest_values_p + idx[j]
+                self.instrs.append({
+                    "alu": [
+                        ("+", tree_addrs + j, self.scratch["forest_values_p"], idx_base + j)
+                        for j in range(VLEN)
+                    ]
+                })
                 
-                # Now load 8 tree node values using both load slots (4 cycles)
-                for j in range(0, VLEN, 2):  # 0, 2, 4, 6
+                # Load 8 tree node values using both load slots (4 cycles)
+                for j in range(0, VLEN, 2):
                     self.instrs.append({
                         "load": [
                             ("load", node_vals + j, tree_addrs + j),
@@ -198,42 +243,37 @@ class KernelBuilder:
                         ]
                     })
                 
-                # === COMPUTE PHASE: Process each walker in batch ===
-                # (Still scalar for now, but node values are gathered)
-                body = []
-                for j in range(VLEN):
-                    walker_i = batch_offset + j
-                    scratch_idx_addr = walker_idx + walker_i
-                    scratch_val_addr = walker_val + walker_i
-                    
-                    # Copy walker's idx and val to working registers
-                    body.append(("alu", ("+", tmp_idx, scratch_idx_addr, zero_const)))
-                    body.append(("alu", ("+", tmp_val, scratch_val_addr, zero_const)))
-                    
-                    # node_val is already gathered in node_vals[j]
-                    body.append(("alu", ("+", tmp_node_val, node_vals + j, zero_const)))
-                    
-                    # val = myhash(val ^ node_val)
-                    body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                    body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, walker_i))
-                    
-                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                    body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                    body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                    body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                    body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                    body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                    
-                    # idx = 0 if idx >= n_nodes else idx
-                    body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                    
-                    # Store idx and val back to scratch
-                    body.append(("alu", ("+", scratch_idx_addr, tmp_idx, zero_const)))
-                    body.append(("alu", ("+", scratch_val_addr, tmp_val, zero_const)))
+                # === PRE-HASH SIMD: XOR values with node values ===
+                # val_vec ^= node_vals (8 XORs in one vALU slot)
+                self.instrs.append({
+                    "valu": [("^", val_base, val_base, node_vals)]
+                })
                 
-                body_instrs = self.build(body)
-                self.instrs.extend(body_instrs)
+                # === HASH PHASE: Now fully SIMD! ===
+                hash_instrs = self.build_hash_simd(val_base, tmp1_vec, tmp2_vec, hash_const_vecs)
+                self.instrs.extend(hash_instrs)
+                
+                # === POST-HASH SIMD: Compute next indices ===
+                # tmp1_vec = val_vec % 2
+                self.instrs.append({"valu": [("%", tmp1_vec, val_base, two_vec)]})
+                
+                # tmp1_vec = (tmp1_vec == 0)
+                self.instrs.append({"valu": [("==", tmp1_vec, tmp1_vec, zero_vec)]})
+                
+                # tmp3_vec = tmp1_vec ? 1 : 2 (vselect)
+                self.instrs.append({"flow": [("vselect", tmp3_vec, tmp1_vec, one_vec, two_vec)]})
+                
+                # idx_vec = idx_vec * 2
+                self.instrs.append({"valu": [("*", idx_base, idx_base, two_vec)]})
+                
+                # idx_vec = idx_vec + tmp3_vec
+                self.instrs.append({"valu": [("+", idx_base, idx_base, tmp3_vec)]})
+                
+                # tmp1_vec = idx_vec < n_nodes_vec
+                self.instrs.append({"valu": [("<", tmp1_vec, idx_base, n_nodes_vec)]})
+                
+                # idx_vec = tmp1_vec ? idx_vec : 0 (vselect)
+                self.instrs.append({"flow": [("vselect", idx_base, tmp1_vec, idx_base, zero_vec)]})
 
         # ============ STORE PHASE: Write final values to memory ============
         # Only need to store values (indices not checked by test)
