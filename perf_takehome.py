@@ -19,6 +19,7 @@ import unittest
 
 from problem import (
     Engine,
+    Instruction,
     DebugInfo,
     SLOT_LIMITS,
     VLEN,
@@ -33,29 +34,38 @@ from problem import (
     reference_kernel2,
 )
 
+# Type alias for an operation assigned to an engine: (engine_name, operation_tuple)
+AssignedOp = tuple[Engine, tuple]
+
 
 class KernelBuilder:
-    def __init__(self):
+    instrs: list[Instruction]
+    scratch: dict[str, int]
+    scratch_debug: dict[int, tuple[str, int]]
+    scratch_ptr: int
+    const_map: dict[int, int]
+
+    def __init__(self) -> None:
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
 
-    def debug_info(self):
+    def debug_info(self) -> DebugInfo:
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[AssignedOp], vliw: bool = False) -> list[Instruction]:
         # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
+        instrs: list[Instruction] = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
         return instrs
 
-    def add(self, engine, slot):
+    def add(self, engine: Engine, slot: tuple) -> None:
         self.instrs.append({engine: [slot]})
 
-    def alloc_scratch(self, name=None, length=1):
+    def alloc_scratch(self, name: str | None = None, length: int = 1) -> int:
         addr = self.scratch_ptr
         if name is not None:
             self.scratch[name] = addr
@@ -64,15 +74,17 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def scratch_const(self, val: int, name: str | None = None) -> int:
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
             self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+    def build_hash(
+        self, val_hash_addr: int, tmp1: int, tmp2: int, round: int, i: int
+    ) -> list[AssignedOp]:
+        slots: list[AssignedOp] = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
@@ -84,7 +96,7 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+    ) -> None:
         """
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
@@ -172,6 +184,7 @@ class KernelBuilder:
 
 BASELINE = 147734
 
+
 def do_kernel_test(
     forest_height: int,
     rounds: int,
@@ -179,7 +192,7 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
-):
+) -> int:
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
